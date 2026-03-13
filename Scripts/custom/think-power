@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+# --- Path Configuration ---
+LMI="/sys/class/firmware-attributes/thinklmi/attributes"
+FAN="/proc/acpi/ibm/fan"
+BAT="/sys/class/power_supply/BAT0"
+
+# --- Root Check ---
+if [[ $EUID -ne 0 ]]; then
+  echo "This script must be run as root. Try: sudo think-power $1"
+  exit 1
+fi
+
+# --- Helper Functions ---
+send_notification() {
+  # Detects the real user even when running under sudo
+  local user_id=$(logname || echo $USER)
+  local user_uid=$(id -u "$user_id")
+  # Tries to send notification to the user's D-Bus session
+  sudo -u "$user_id" DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"$user_uid"/bus notify-send "$1" "$2" -i "$3" 2>/dev/null
+}
+
+apply_bios() {
+  if [ -f "$LMI/$1/current_value" ]; then
+    # printf avoids adding unwanted newlines
+    printf "%s" "$2" >"$LMI/$1/current_value" || echo "Error writing '$2' to $1"
+  fi
+}
+
+save_bios() {
+  [ -f "/sys/class/firmware-attributes/thinklmi/save_settings" ] && echo "1" >"/sys/class/firmware-attributes/thinklmi/save_settings"
+}
+
+# --- Main Logic ---
+case "$1" in
+--workstation | -w)
+  echo "🚀 Activating Workstation Mode (T15g)..."
+  apply_bios "GraphicsDevice" "DiscreteGfx"
+  apply_bios "AdaptiveThermalManagementAC" "MaximizePerformance"
+  [ -f "$FAN" ] && echo "level 7" >"$FAN"
+  save_bios
+  send_notification "Think-Power" "Workstation Mode: dGPU Set & Fans Max. Reboot for MUX." "accessories-calculator"
+  ;;
+
+--quiet | -q)
+  echo "🍃 Activating Quiet Mode..."
+  apply_bios "GraphicsDevice" "SwitchableGfx"
+  apply_bios "AdaptiveThermalManagementAC" "Balanced"
+  [ -f "$FAN" ] && echo "level auto" >"$FAN"
+  save_bios
+  send_notification "Think-Power" "Quiet Mode: Hybrid Active & Fans Auto. Reboot required." "battery"
+  ;;
+
+--desk | -d)
+  echo "🔌 Enabling AC Desk Mode..."
+  if [ -d "$BAT" ]; then
+    echo "40" >"$BAT/charge_control_start_threshold"
+    echo "60" >"$BAT/charge_control_end_threshold"
+    send_notification "Think-Power" "Desk Mode: Charging capped at 60%." "ac-adapter"
+  fi
+  ;;
+
+--full | -f)
+  echo "🔋 Enabling Travel Mode..."
+  if [ -d "$BAT" ]; then
+    echo "96" >"$BAT/charge_control_start_threshold"
+    echo "100" >"$BAT/charge_control_end_threshold"
+    send_notification "Think-Power" "Travel Mode: Charging to 100%." "battery-full"
+  fi
+  ;;
+
+--status | -s)
+  echo "--- ThinkPad T15g Status ---"
+  [ -f "$LMI/GraphicsDevice/current_value" ] && echo "Graphics Mode: $(cat $LMI/GraphicsDevice/current_value)"
+  [ -f "$LMI/AdaptiveThermalManagementAC/current_value" ] && echo "Thermal Policy: $(cat $LMI/AdaptiveThermalManagementAC/current_value)"
+  [ -f "$FAN" ] && echo "Fan Speed:     $(cat $FAN | grep speed)"
+  [ -f "$BAT/charge_control_end_threshold" ] && echo "Battery Cap:   $(cat $BAT/charge_control_end_threshold)%"
+  ;;
+
+*)
+  echo "Usage: think-power {--workstation|--quiet|--desk|--full|--status}"
+  exit 1
+  ;;
+esac
