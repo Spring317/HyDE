@@ -4,6 +4,7 @@
 LMI="/sys/class/firmware-attributes/thinklmi/attributes"
 FAN="/proc/acpi/ibm/fan"
 BAT="/sys/class/power_supply/BAT0"
+FAN_CTRL="/sys/module/thinkpad_acpi/parameters/fan_control"
 
 # --- Root Check ---
 if [[ $EUID -ne 0 ]]; then
@@ -13,22 +14,48 @@ fi
 
 # --- Helper Functions ---
 send_notification() {
-  # Detects the real user even when running under sudo
-  local user_id=$(logname || echo $USER)
+  local user_id=$(logname 2>/dev/null || echo $USER)
   local user_uid=$(id -u "$user_id")
-  # Tries to send notification to the user's D-Bus session
-  sudo -u "$user_id" DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"$user_uid"/bus notify-send "$1" "$2" -i "$3" 2>/dev/null
+  if [[ -n "$DISPLAY" || -n "$WAYLAND_DISPLAY" ]]; then
+    sudo -u "$user_id" DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"$user_uid"/bus notify-send "$1" "$2" -i "$3" 2>/dev/null
+  fi
 }
 
 apply_bios() {
-  if [ -f "$LMI/$1/current_value" ]; then
-    # printf avoids adding unwanted newlines
-    printf "%s" "$2" >"$LMI/$1/current_value" || echo "Error writing '$2' to $1"
+  local attr_path="$LMI/$1/current_value"
+  if [ -f "$attr_path" ]; then
+    local current_val=$(cat "$attr_path")
+    if [ "$current_val" != "$2" ]; then
+      printf "%s" "$2" >"$attr_path" 2>/dev/null || echo "Error writing '$2' to $1"
+    fi
+  fi
+}
+
+set_fan_level() {
+  if [ -f "$FAN" ]; then
+    # Attempt to set the fan level
+    if ! echo "level $1" >"$FAN" 2>/dev/null; then
+      echo "⚠️  Fan control locked. Forcing driver unlock..."
+
+      # 1. Force the parameter change in the config file
+      echo "options thinkpad_acpi fan_control=1" | sudo tee /etc/modprobe.d/thinkpad_acpi.conf >/dev/null
+
+      # 2. Force the live reload (This is the "Violent" part)
+      # We use -f to force removal if needed
+      modprobe -r thinkpad_acpi 2>/dev/null || modprobe -rf thinkpad_acpi 2>/dev/null
+      modprobe thinkpad_acpi fan_control=1
+
+      # 3. Final attempt to set the level
+      echo "level $1" >"$FAN" 2>/dev/null && echo "✅ Fan level $1 forced successfully." || echo "❌ Hardware override failed."
+    else
+      echo "✅ Fan level set to $1"
+    fi
   fi
 }
 
 save_bios() {
-  [ -f "/sys/class/firmware-attributes/thinklmi/save_settings" ] && echo "1" >"/sys/class/firmware-attributes/thinklmi/save_settings"
+  local save_path="/sys/class/firmware-attributes/thinklmi/save_settings"
+  [ -f "$save_path" ] && echo "1" >"$save_path"
 }
 
 # --- Main Logic ---
@@ -37,7 +64,7 @@ case "$1" in
   echo "🚀 Activating Workstation Mode (T15g)..."
   apply_bios "GraphicsDevice" "DiscreteGfx"
   apply_bios "AdaptiveThermalManagementAC" "MaximizePerformance"
-  [ -f "$FAN" ] && echo "level 7" >"$FAN"
+  set_fan_level "7"
   save_bios
   send_notification "Think-Power" "Workstation Mode: dGPU Set & Fans Max. Reboot for MUX." "accessories-calculator"
   ;;
@@ -46,7 +73,7 @@ case "$1" in
   echo "🍃 Activating Quiet Mode..."
   apply_bios "GraphicsDevice" "SwitchableGfx"
   apply_bios "AdaptiveThermalManagementAC" "Balanced"
-  [ -f "$FAN" ] && echo "level auto" >"$FAN"
+  set_fan_level "auto"
   save_bios
   send_notification "Think-Power" "Quiet Mode: Hybrid Active & Fans Auto. Reboot required." "battery"
   ;;
@@ -73,8 +100,9 @@ case "$1" in
   echo "--- ThinkPad T15g Status ---"
   [ -f "$LMI/GraphicsDevice/current_value" ] && echo "Graphics Mode: $(cat $LMI/GraphicsDevice/current_value)"
   [ -f "$LMI/AdaptiveThermalManagementAC/current_value" ] && echo "Thermal Policy: $(cat $LMI/AdaptiveThermalManagementAC/current_value)"
-  [ -f "$FAN" ] && echo "Fan Speed:     $(cat $FAN | grep speed)"
+  [ -f "$FAN" ] && echo "Fan Speed:     $(cat $FAN | grep speed | awk '{print $2}') RPM"
   [ -f "$BAT/charge_control_end_threshold" ] && echo "Battery Cap:   $(cat $BAT/charge_control_end_threshold)%"
+  [ -f "$LMI/pending_reboot/current_value" ] && echo "Pending Reboot: $(cat $LMI/pending_reboot/current_value)"
   ;;
 
 *)
